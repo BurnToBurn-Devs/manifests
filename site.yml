@@ -2,19 +2,60 @@
 - name: Configure and set up server environment
   hosts: all
   become: true
+  vars_files:
+    - secrets.yml
   vars:
     docker_keyring_dir: /etc/apt/keyrings
     docker_key: '{{ docker_keyring_dir }}/docker.asc'
     docker_repo_file: /etc/apt/sources.list.d/docker.list
+    deploy_user: "{{ lookup('env', 'DEPLOY_USER') }}"
+    deploy_pubkey: "{{ lookup('env', 'DEPLOY_PUBKEY') }}"
+    mysql_database: "{{ lookup('env', 'DB_NAME') }}"
+    mysql_user: "{{ lookup('env', 'DB_USERNAME') }}"
+    mysql_password: "{{ lookup('env', 'DB_PASSWORD') }}"
+    mysql_root_password: "{{ lookup('env', 'DB_ROOT_PASSWORD') }}"
+
+  pre_tasks:
+    - name: Fail if DEPLOY_USER or DEPLOY_PUBKEY not defined
+      ansible.builtin.fail:
+        msg: 'DEPLOY_USER and DEPLOY_PUBKEY must be set in the environment.'
+      when: deploy_user == "" or deploy_pubkey == ""
+
+    - name: Fail if any MySQL credentials are not defined
+      ansible.builtin.fail:
+        msg: 'MySQL env vars (DB_NAME, DB_USERNAME, DB_PASSWORD, DB_ROOT_PASSWORD) are required.'
+      when: mysql_database == "" or mysql_user == "" or mysql_password == "" or mysql_root_password == ""
+
   tasks:
-    - name: Update apt cache
+    - block:
+        - name: Create deploy user for Docker app
+          ansible.builtin.user:
+            name: '{{ deploy_user }}'
+            comment: 'Deployment account for Docker application'
+            create_home: yes
+            shell: /bin/bash
+            groups: docker,sudo
+            state: present
+
+        - name: Ensure .ssh directory exists
+          ansible.builtin.file:
+            path: '/home/{{ deploy_user }}/.ssh'
+            state: directory
+            mode: '0700'
+            owner: '{{ deploy_user }}'
+            group: '{{ deploy_user }}'
+
+        - name: Add deploy user's public key
+          ansible.builtin.authorized_key:
+            user: '{{ deploy_user }}'
+            state: present
+            key: '{{ deploy_pubkey }}'
+      tags: deploy-user
+
+    - name: Update apt cache and install base packages
       ansible.builtin.apt:
         update_cache: yes
         cache_valid_time: 3600
-      tags: update
-
-    - name: Install required packages
-      ansible.builtin.apt:
         name:
           - zsh
           - tmux
@@ -31,7 +72,7 @@
         state: present
       tags: packages
 
-    - name: Install oh-my-zsh
+    - name: Install oh-my-zsh for root
       ansible.builtin.shell: >
         sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
       args:
@@ -42,29 +83,23 @@
         CHSH: 'yes'
       tags: ohmyzsh
 
-    - name: Disable automatic apt timers and services
-      block:
-        - name: Stop apt daily timer
+    - block:
+        - name: Stop and disable apt daily timers
           ansible.builtin.systemd:
-            name: apt-daily.timer
+            name: '{{ item }}'
             state: stopped
             enabled: no
+          loop:
+            - apt-daily.timer
+            - apt-daily-upgrade.timer
 
-        - name: Stop apt daily upgrade timer
+        - name: Mask apt daily services
           ansible.builtin.systemd:
-            name: apt-daily-upgrade.timer
-            state: stopped
-            enabled: no
-
-        - name: Mask apt daily service
-          ansible.builtin.systemd:
-            name: apt-daily.service
+            name: '{{ item }}'
             masked: yes
-
-        - name: Mask apt daily upgrade service
-          ansible.builtin.systemd:
-            name: apt-daily-upgrade.service
-            masked: yes
+          loop:
+            - apt-daily.service
+            - apt-daily-upgrade.service
       tags: apt-timers
 
     - name: Disable auto-upgrades
@@ -83,86 +118,64 @@
         state: absent
       tags: auto-upgrades
 
-    - name: Configure Git settings
-      block:
-        - name: Set Git username
+    - block:
+        - name: Configure Git username
           ansible.builtin.git_config:
             name: user.name
             scope: global
             value: 'IamGroooooot'
 
-        - name: Set Git email
+        - name: Configure Git email
           ansible.builtin.git_config:
             name: user.email
             scope: global
             value: 'dury.ko@gmail.com'
       tags: git
 
-    - name: Create local bin directory
+    - name: Create local bin directory for root
       ansible.builtin.file:
         path: /root/.local/bin
         state: directory
         mode: '0755'
       tags: directories
 
-    - name: Set up Docker repository and install Docker
-      block:
+    - block:
         - name: Install Docker dependencies
           ansible.builtin.apt:
             name:
               - ca-certificates
               - curl
             state: present
-          tags: docker
 
-        - name: Create directory for apt keyrings
+        - name: Create Docker apt keyrings directory
           ansible.builtin.file:
             path: '{{ docker_keyring_dir }}'
             state: directory
             mode: '0755'
-            owner: root
-            group: root
-          tags: docker
 
-        - name: Download Docker's official GPG key
+        - name: Download Docker GPG key
           ansible.builtin.get_url:
             url: https://download.docker.com/linux/ubuntu/gpg
             dest: '{{ docker_key }}'
-            mode: '0755'
-            owner: root
-            group: root
-          tags: docker
-
-        - name: Ensure Docker GPG key is world-readable
-          ansible.builtin.file:
-            path: '{{ docker_key }}'
             mode: '0644'
-            owner: root
-            group: root
-          tags: docker
 
-        - name: Get system architecture via dpkg
+        - name: Get system architecture
           ansible.builtin.command: dpkg --print-architecture
           register: dpkg_arch
           changed_when: false
-          tags: docker
 
         - name: Add Docker repository to apt sources
           ansible.builtin.copy:
             dest: '{{ docker_repo_file }}'
             content: |
               deb [arch={{ dpkg_arch.stdout }} signed-by={{ docker_key }}] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename | default(ansible_distribution_release) }} stable
-            owner: root
-            group: root
             mode: '0644'
-          tags: docker
 
         - name: Update apt cache after adding Docker repo
           ansible.builtin.apt:
             update_cache: yes
-          tags: docker
 
-        - name: Install Docker and related packages
+        - name: Install Docker packages
           ansible.builtin.apt:
             name:
               - docker-ce
@@ -172,25 +185,43 @@
               - docker-compose-plugin
             state: latest
             update_cache: yes
-          tags: docker
 
         - name: Ensure Docker service is running
           ansible.builtin.systemd:
             name: docker
             state: started
             enabled: yes
-          tags: docker
       tags: docker
 
-    - name: Install SDKMAN and Java/Gradle
+    - name: Install SDKMAN, Java & Gradle
       ansible.builtin.shell: |
         curl -s "https://get.sdkman.io" | bash
         source "$HOME/.sdkman/bin/sdkman-init.sh"
-        sdk install java 21.0.4-librca
-        sdk default java 21.0.4-librca
-        sdk install gradle 8.12
-        sdk default gradle 8.12
+        sdk install java 21.0.4-librca && sdk default java 21.0.4-librca
+        sdk install gradle 8.12 && sdk default gradle 8.12
       args:
         executable: /bin/bash
         creates: /root/.sdkman
       tags: sdkman
+
+    - block:
+        - name: Create Docker volume for MySQL data
+          community.docker.docker_volume:
+            name: db-data
+
+        - name: Run MySQL container
+          community.docker.docker_container:
+            name: mysql
+            image: mysql:8.4.4
+            state: started
+            restart_policy: always
+            published_ports:
+              - '3306:3306'
+            volumes:
+              - db-data:/var/lib/mysql
+            env:
+              MYSQL_DATABASE: '{{ mysql_database }}'
+              MYSQL_USER: '{{ mysql_user }}'
+              MYSQL_PASSWORD: '{{ mysql_password }}'
+              MYSQL_ROOT_PASSWORD: '{{ mysql_root_password }}'
+      tags: mysql

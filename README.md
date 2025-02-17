@@ -106,6 +106,8 @@ terraform destroy -auto-approve
   - 공식 GPG 키/리포지토리 추가
   - Docker 패키지 설치 및 서비스 실행 보장
 - SDKMAN을 통한 Java 21, Gradle 8.12 설치
+- 배포용 유저 생성 및 권한 부여
+- MySQL 8 설치 및 구성
 
 ### 파일 구성
 
