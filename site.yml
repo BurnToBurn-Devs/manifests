@@ -1,0 +1,196 @@
+---
+- name: Configure and set up server environment
+  hosts: all
+  become: true
+  vars:
+    docker_keyring_dir: /etc/apt/keyrings
+    docker_key: '{{ docker_keyring_dir }}/docker.asc'
+    docker_repo_file: /etc/apt/sources.list.d/docker.list
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      tags: update
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - zsh
+          - tmux
+          - python3
+          - vim
+          - git
+          - net-tools
+          - zip
+          - unzip
+          - iputils-ping
+          - wget
+          - cmake
+          - build-essential
+        state: present
+      tags: packages
+
+    - name: Install oh-my-zsh
+      ansible.builtin.shell: >
+        sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+      args:
+        creates: /root/.oh-my-zsh
+        executable: /bin/bash
+      environment:
+        RUNZSH: 'no'
+        CHSH: 'yes'
+      tags: ohmyzsh
+
+    - name: Disable automatic apt timers and services
+      block:
+        - name: Stop apt daily timer
+          ansible.builtin.systemd:
+            name: apt-daily.timer
+            state: stopped
+            enabled: no
+
+        - name: Stop apt daily upgrade timer
+          ansible.builtin.systemd:
+            name: apt-daily-upgrade.timer
+            state: stopped
+            enabled: no
+
+        - name: Mask apt daily service
+          ansible.builtin.systemd:
+            name: apt-daily.service
+            masked: yes
+
+        - name: Mask apt daily upgrade service
+          ansible.builtin.systemd:
+            name: apt-daily-upgrade.service
+            masked: yes
+      tags: apt-timers
+
+    - name: Disable auto-upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Unattended-Upgrade "0";
+        owner: root
+        mode: '0644'
+      tags: auto-upgrades
+
+    - name: Remove unattended-upgrades package
+      ansible.builtin.apt:
+        name: unattended-upgrades
+        state: absent
+      tags: auto-upgrades
+
+    - name: Configure Git settings
+      block:
+        - name: Set Git username
+          ansible.builtin.git_config:
+            name: user.name
+            scope: global
+            value: 'IamGroooooot'
+
+        - name: Set Git email
+          ansible.builtin.git_config:
+            name: user.email
+            scope: global
+            value: 'dury.ko@gmail.com'
+      tags: git
+
+    - name: Create local bin directory
+      ansible.builtin.file:
+        path: /root/.local/bin
+        state: directory
+        mode: '0755'
+      tags: directories
+
+    - name: Set up Docker repository and install Docker
+      block:
+        - name: Install Docker dependencies
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+            state: present
+          tags: docker
+
+        - name: Create directory for apt keyrings
+          ansible.builtin.file:
+            path: '{{ docker_keyring_dir }}'
+            state: directory
+            mode: '0755'
+            owner: root
+            group: root
+          tags: docker
+
+        - name: Download Docker's official GPG key
+          ansible.builtin.get_url:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            dest: '{{ docker_key }}'
+            mode: '0755'
+            owner: root
+            group: root
+          tags: docker
+
+        - name: Ensure Docker GPG key is world-readable
+          ansible.builtin.file:
+            path: '{{ docker_key }}'
+            mode: '0644'
+            owner: root
+            group: root
+          tags: docker
+
+        - name: Get system architecture via dpkg
+          ansible.builtin.command: dpkg --print-architecture
+          register: dpkg_arch
+          changed_when: false
+          tags: docker
+
+        - name: Add Docker repository to apt sources
+          ansible.builtin.copy:
+            dest: '{{ docker_repo_file }}'
+            content: |
+              deb [arch={{ dpkg_arch.stdout }} signed-by={{ docker_key }}] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename | default(ansible_distribution_release) }} stable
+            owner: root
+            group: root
+            mode: '0644'
+          tags: docker
+
+        - name: Update apt cache after adding Docker repo
+          ansible.builtin.apt:
+            update_cache: yes
+          tags: docker
+
+        - name: Install Docker and related packages
+          ansible.builtin.apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: latest
+            update_cache: yes
+          tags: docker
+
+        - name: Ensure Docker service is running
+          ansible.builtin.systemd:
+            name: docker
+            state: started
+            enabled: yes
+          tags: docker
+      tags: docker
+
+    - name: Install SDKMAN and Java/Gradle
+      ansible.builtin.shell: |
+        curl -s "https://get.sdkman.io" | bash
+        source "$HOME/.sdkman/bin/sdkman-init.sh"
+        sdk install java 21.0.4-librca
+        sdk default java 21.0.4-librca
+        sdk install gradle 8.12
+        sdk default gradle 8.12
+      args:
+        executable: /bin/bash
+        creates: /root/.sdkman
+      tags: sdkman
